@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Wait for few seconds for network to be ready
+echo waiting for networks to be ready
+sleep 10
+
 # Adding edpm ansible-runner specific scripts here
 # Expand the variables
 eval "echo \"$(cat /runner/env/settings)\"" > /runner/env/settings
