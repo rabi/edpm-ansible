@@ -77,6 +77,74 @@
   roles:
     - role: osp.edpm.edpm_cleanup
 
+- name: Deploy container-scoped cleanup test service
+  hosts: all
+  gather_facts: false
+  vars:
+    edpm_container_standalone_service: test_service4_container
+    edpm_service_name: test_service4
+    edpm_container_standalone_container_defs:
+      test_service4_container:
+        image: quay.io/centos/centos:stream10
+        net: host
+        privileged: true
+        restart: always
+        command: sleep 3600
+        environment:
+            KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
+    edpm_container_standalone_kolla_config_files:
+      test_service4_container:
+        command: 'sleep 3600'
+  roles:
+    - role: "osp.edpm.edpm_container_standalone"
+  tasks:
+    - name: Create container-scoped healthcheck directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openstack/healthchecks/test_service4_container
+        state: directory
+        mode: '0755'
+
+- name: Cleanup container-scoped test service using service types
+  hosts: all
+  gather_facts: false
+  vars:
+    edpm_service_types:
+      - test_service2
+  roles:
+    - role: osp.edpm.edpm_cleanup
+
+- name: Deploy service type comparison test service
+  hosts: all
+  gather_facts: false
+  vars:
+    edpm_container_standalone_service: test_service5_container
+    edpm_service_name: test_service5
+    edpm_container_standalone_container_defs:
+      test_service5_container:
+        image: quay.io/centos/centos:stream10
+        net: host
+        privileged: true
+        restart: always
+        command: sleep 3600
+        environment:
+            KOLLA_CONFIG_STRATEGY: COPY_ALWAYS
+    edpm_container_standalone_kolla_config_files:
+      test_service5_container:
+        command: 'sleep 3600'
+  roles:
+    - role: "osp.edpm.edpm_container_standalone"
+
+- name: Cleanup with service types keep list
+  hosts: all
+  gather_facts: false
+  vars:
+    edpm_service_types:
+      - test_service2
+      - test_service5
+  roles:
+    - role: osp.edpm.edpm_cleanup
+
 - name: Deploy service with multiple containers
   hosts: all
   gather_facts: false

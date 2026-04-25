@@ -46,6 +46,32 @@
         fail_msg: "test_service2_container should still exist"
         success_msg: "test_service2_container still exists as expected"
 
+    - name: Check if test_service5 container exists (should still exist)
+      command: podman container exists test_service5_container
+      register: _service5_check
+      failed_when: false
+      changed_when: false
+
+    - name: Verify test_service5 container still exists
+      ansible.builtin.assert:
+        that:
+          - _service5_check.rc == 0
+        fail_msg: "test_service5_container should still exist"
+        success_msg: "test_service5_container still exists as expected"
+
+    - name: Check if container-scoped cleanup test container exists (should be removed)
+      command: podman container exists test_service4_container
+      register: _service4_check
+      failed_when: false
+      changed_when: false
+
+    - name: Verify container-scoped cleanup test container was removed
+      ansible.builtin.assert:
+        that:
+          - _service4_check.rc != 0
+        fail_msg: "test_service4_container should have been removed"
+        success_msg: "test_service4_container was successfully removed"
+
 - name: Verify orphaned container cleanup
   hosts: all
   gather_facts: false
@@ -131,6 +157,30 @@
         fail_msg: "Kolla config for test_service3_container_a should still exist"
         success_msg: "Kolla config for test_service3_container_a still exists as expected"
 
+    - name: Check if startup config directory for test_service4 container exists
+      ansible.builtin.stat:
+        path: /var/lib/edpm-config/container-startup-config/test_service4_container
+      register: _service4_startup_dir
+
+    - name: Verify startup config directory for test_service4 container was removed
+      ansible.builtin.assert:
+        that:
+          - not _service4_startup_dir.stat.exists
+        fail_msg: "Startup config directory for test_service4_container should not exist"
+        success_msg: "Startup config directory for test_service4_container was removed"
+
+    - name: Check if healthcheck directory for test_service4 container exists
+      ansible.builtin.stat:
+        path: /var/lib/openstack/healthchecks/test_service4_container
+      register: _service4_healthcheck_dir
+
+    - name: Verify healthcheck directory for test_service4 container was removed
+      ansible.builtin.assert:
+        that:
+          - not _service4_healthcheck_dir.stat.exists
+        fail_msg: "Healthcheck directory for test_service4_container should not exist"
+        success_msg: "Healthcheck directory for test_service4_container was removed"
+
 - name: Verify image pruning after service cleanup
   hosts: all
   gather_facts: false
@@ -180,3 +230,18 @@
         fail_msg: >-
           State file should have container_a and container_c but not container_b
         success_msg: "State file correctly reflects the updated service"
+
+    - name: Verify test_service5 remains in state file
+      ansible.builtin.assert:
+        that:
+          - "'test_service5' in _state_data.services"
+          - "'test_service5_container' in _state_data.services.test_service5.containers"
+        fail_msg: "test_service5 should still exist in the state file"
+        success_msg: "test_service5 correctly kept in the state file"
+
+    - name: Verify test_service4 was removed from state file
+      ansible.builtin.assert:
+        that:
+          - "'test_service4' not in _state_data.services"
+        fail_msg: "test_service4 should have been removed from the state file"
+        success_msg: "test_service4 correctly removed from the state file"

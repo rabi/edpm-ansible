@@ -132,11 +132,7 @@ edpm_cleanup_remove_config_dirs: true
 edpm_cleanup_orphaned_containers: false
 
 # List of container names to exclude from orphaned container cleanup
-# These containers use edpm_container_manage which doesn't track state
-edpm_cleanup_excluded_containers:
-  - nova_compute
-  - nova_compute_init
-  - nova_nvme_cleaner
+edpm_cleanup_excluded_containers: []
 
 # Generic paths to clean up per service
 # Use __SERVICE_NAME__ as a placeholder that will be replaced during cleanup
@@ -199,7 +195,7 @@ edpm_cleanup_orphaned_containers: true
 5. Logs the list of orphaned containers before removal
 
 **Excluded Containers:**
-Some containers (like nova_compute) use `edpm_container_manage` which adds the `managed_by=edpm_ansible` label but doesn't track containers in the state file. These are excluded by default via `edpm_cleanup_excluded_containers` to prevent accidental removal.
+Containers listed in `edpm_cleanup_excluded_containers` are skipped during orphaned container cleanup. By default, no containers are excluded.
 
 **Use Cases:**
 - Cleaning up after failed migrations
@@ -275,7 +271,7 @@ Benefits of the new approach:
 
 ### Customize Excluded Containers
 
-By default, nova containers are excluded from orphaned cleanup because they use `edpm_container_manage` which doesn't track state. You can customize this list:
+By default, no containers are excluded from orphaned cleanup. You can customize this list to protect specific containers:
 
 ```yaml
 - hosts: edpm_nodes
@@ -283,11 +279,7 @@ By default, nova containers are excluded from orphaned cleanup because they use 
     edpm_services:
       - nova
     edpm_cleanup_orphaned_containers: true
-    # Add or remove containers from exclusion list
     edpm_cleanup_excluded_containers:
-      - nova_compute
-      - nova_compute_init
-      - nova_nvme_cleaner
       - my_custom_container
   roles:
     - osp.edpm.edpm_cleanup
