@@ -1,0 +1,128 @@
+---
+# Throwaway: is ubuntu-24.04 usable for molecule, and does /etc/shadow mode
+# explain the sudo/PAM failure? Probes only -- nothing is asserted as a gate.
+#
+# Triggers on its own path only, so it runs from a PR that adds exactly this
+# file, and from workflow_dispatch on any branch. Delete once OSPRH-38428
+# is resolved.
+
+name: osp rh 38428 probe
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/osprh-38428-probe.yml
+
+jobs:
+  host-probe:
+    name: host + container probe (${{ matrix.runs-on }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    continue-on-error: true
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: host posture
+        run: |
+          grep PRETTY /etc/os-release; uname -r
+          echo "unix-chkpwd profile: $([ -e /etc/apparmor.d/unix-chkpwd ] && echo present || echo ABSENT)"
+          echo "10-apparmor.conf:    $([ -e /usr/lib/sysctl.d/10-apparmor.conf ] && echo present || echo ABSENT)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "userns sysctl: absent"
+          podman --version
+          buildah --version
+          echo "crun via podman: $(podman info --format '{{.Host.OCIRuntime.Path}}' 2>&1)"
+          crun --version 2>&1; /usr/local/bin/crun --version 2>&1 || true
+
+      - name: image /etc/shadow as stored vs as mounted
+        run: |
+          set -uo pipefail
+          podman pull -q registry.access.redhat.com/ubi9/ubi-init:latest >/dev/null
+          echo "-- stored in image (no container mount) --"
+          podman run --rm --entrypoint stat registry.access.redhat.com/ubi9/ubi-init:latest \
+            -c 'mode=%a owner=%u:%g' /etc/shadow 2>&1 || true
+          echo "-- inside a rootless privileged container --"
+          podman run --rm --privileged --ulimit host \
+            --entrypoint stat registry.access.redhat.com/ubi9/ubi-init:latest \
+            -c 'mode=%a owner=%u:%g' /etc/shadow 2>&1 || true
+          echo "-- rootful --"
+          sudo -E podman run --rm --privileged --ulimit host \
+            --entrypoint stat registry.access.redhat.com/ubi9/ubi-init:latest \
+            -c 'mode=%a owner=%u:%g' /etc/shadow 2>&1 || true
+
+      - name: sudo works in the molecule image?
+        run: |
+          set -uo pipefail
+          # same shape as molecule/common/Containerfile.j2
+          d=$(mktemp -d); cd "$d"
+          { echo 'FROM registry.access.redhat.com/ubi9/ubi-init:latest'
+            echo 'RUN dnf upgrade -y && dnf -y install sudo python3 hostname which && dnf clean all -y'
+            echo 'CMD ["/sbin/init"]'; } > Containerfile
+          podman build -t probe . 2>&1 | tail -5
+          echo "=== rootless, as-built ==="
+          podman run --rm --privileged --ulimit host --entrypoint bash probe -c '
+            stat -c "shadow mode=%a owner=%u:%g" /etc/shadow
+            echo "confined=$(cat /proc/self/attr/current 2>&1)"
+            sudo -n true; echo "sudo -n rc=$?"' 2>&1 || true
+          echo "=== rootless, runtime chmod 0400 ==="
+          podman run --rm --privileged --ulimit host --entrypoint bash probe -c '
+            chmod 0400 /etc/shadow
+            stat -c "shadow mode=%a owner=%u:%g" /etc/shadow
+            sudo -n true; echo "sudo -n rc=$?"' 2>&1 || true
+          echo "=== rootful, as-built ==="
+          sudo -E podman run --rm --privileged --ulimit host --entrypoint bash probe -c '
+            stat -c "shadow mode=%a owner=%u:%g" /etc/shadow
+            sudo -n true; echo "sudo -n rc=$?"' 2>&1 || true
+
+      - name: apparmor denials
+        if: always()
+        run: |
+          sudo dmesg 2>/dev/null | grep -i apparmor | grep -i denied | tail -40 \
+            || echo "no denials readable"
+
+  molecule-leg:
+    name: molecule ${{ matrix.runs-on }} / ${{ matrix.role }}
+    needs: host-probe
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [ubuntu-24.04]
+        role: [edpm_telemetry]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14'
+      - name: deps
+        run: |
+          pip install ansible
+          ansible-galaxy collection install --force -r requirements.yml
+          pip install -r molecule-requirements.txt
+      - name: molecule test
+        id: mol
+        continue-on-error: true
+        run: |
+          cd roles/${{ matrix.role }}
+          molecule test --all
+        env:
+          PY_COLORS: '1'
+          ANSIBLE_VERBOSITY: 2
+      - name: post-failure forensics
+        if: always()
+        run: |
+          echo "=== containers ==="
+          podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
+          echo "=== shadow mode in instance ==="
+          podman exec instance stat -c 'mode=%a owner=%u:%g' /etc/shadow 2>&1 || true
+          echo "=== sudo inside instance ==="
+          podman exec instance sudo -n true 2>&1 || true
+          echo "=== apparmor denials ==="
+          sudo dmesg 2>/dev/null | grep -i apparmor | grep -i denied | tail -40 || true
+          echo "=== versions ==="
+          podman --version; podman info --format '{{.Host.OCIRuntime.Path}}'
+          pip show molecule molecule-plugins 2>/dev/null | grep -E '^(Name|Version)'
