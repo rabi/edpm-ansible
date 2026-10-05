@@ -62,6 +62,14 @@ jobs:
             echo 'RUN dnf upgrade -y && dnf -y install sudo python3 hostname which && dnf clean all -y'
             echo 'CMD ["/sbin/init"]'; } > Containerfile
           podman build -t probe . 2>&1 | tail -5
+          { echo 'FROM registry.access.redhat.com/ubi9/ubi-init:latest'
+            echo 'RUN dnf upgrade -y && dnf -y install sudo python3 hostname which && dnf clean all -y && chmod 0400 /etc/shadow /etc/gshadow'
+            echo 'CMD ["/sbin/init"]'; } > Containerfile
+          podman build -t probe-fixed . 2>&1 | tail -3
+          echo "=== rootless, build-time chmod (the fix) ==="
+          podman run --rm --privileged --ulimit host --entrypoint bash probe-fixed -c '
+            stat -c "shadow mode=%a owner=%u:%g" /etc/shadow
+            sudo -n true; echo "sudo -n rc=$?"' 2>&1 || true
           echo "=== rootless, as-built ==="
           podman run --rm --privileged --ulimit host --entrypoint bash probe -c '
             stat -c "shadow mode=%a owner=%u:%g" /etc/shadow
@@ -91,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         runs-on: [ubuntu-24.04]
-        role: [edpm_telemetry]
+        role: [edpm_telemetry, edpm_telemetry_power_monitoring]
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
