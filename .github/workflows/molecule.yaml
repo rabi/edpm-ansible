@@ -77,6 +77,18 @@ jobs:
         else
           echo "modified=false" >> $GITHUB_OUTPUT
         fi
+    - name: Select molecule destroy strategy
+      id: flags
+      run: |
+        # These roles fail on ubuntu-24.04 for reasons that are only visible
+        # from inside a live instance, so keep the instance around on failure.
+        destroy=always
+        case "${{ matrix.tested_role }}" in
+        edpm_cyborg | edpm_neutron_sriov | edpm_telemetry_logging)
+          destroy=never
+          ;;
+        esac
+        echo "destroy=$destroy" >>$GITHUB_OUTPUT
     - name: Install ansible
       if: steps.check_role.outputs.modified == 'true'
       run: pip install ansible
@@ -90,9 +102,52 @@ jobs:
       if: steps.check_role.outputs.modified == 'true'
       run: |
         cd $GITHUB_WORKSPACE/roles/${{ matrix.tested_role }}
-        molecule test --all
+        molecule test --all --destroy ${{ steps.flags.outputs.destroy }}
       env:
         PY_COLORS: '1'
         ANSIBLE_FORCE_COLOR: '1'
         ANSIBLE_VERBOSITY: 4
         ANSIBLE_CALLBACKS_ENABLED: profile_tasks
+    - name: Collect diagnostics from surviving instances
+      if: failure() && steps.flags.outputs.destroy == 'never'
+      run: |
+        set +e
+        echo '##### host AppArmor denials #####'
+        # unix_chkpwd reaching /etc/shadow is blocked by the ubuntu
+        # unix-chkpwd profile, which surfaces as a PAM account error.
+        sudo dmesg | grep -i apparmor | tail -n 60
+        echo '##### molecule instances #####'
+        for inst in $(podman ps --format '{{.Names}}'); do
+          echo "===== instance: $inst ====="
+          echo '--- failed units (exit status) ---'
+          podman exec "$inst" systemctl --failed --no-pager
+          echo '--- shadow mode ---'
+          podman exec "$inst" ls -l /etc/shadow
+          echo '--- priority err and above ---'
+          podman exec "$inst" journalctl -p err --no-pager -n 200
+          # The quadlet unit journal is the only place the podman exit status
+          # is recorded once the container is gone. A <name>.container quadlet
+          # becomes <name>.service, so key the lookup off the container names.
+          echo '--- all service units ---'
+          podman exec "$inst" systemctl list-units --all --type=service --no-legend --plain
+          echo '--- nested containers ---'
+          podman exec "$inst" podman ps -a
+          # CONTAINER_NAME keeps stdout and stderr after --rm deletes the
+          # container, and _COMM=podman gives the create/died lifecycle.
+          echo '--- lifecycle events ---'
+          podman exec "$inst" journalctl --no-pager -a --since '-30 min' _COMM=podman 2>/dev/null | tail -n 80
+          # A container started with --rm that exits is absent from podman ps
+          # by the time we look, so take the name set from the journal too.
+          names=$(podman exec "$inst" podman ps -a --format '{{.Names}}' 2>/dev/null)
+          json=$(podman exec "$inst" journalctl --no-pager -a --since '-30 min' -o json 2>/dev/null)
+          journal_names=$(echo "$json" | grep -o '"CONTAINER_NAME":"[^"]*"' | cut -d'"' -f4 | sort -u)
+          for name in $(echo "$names"; echo "$journal_names" | sort -u); do
+            echo "=== container $name ==="
+            podman exec "$inst" systemctl status --no-pager -l "$name".service 2>&1 | head -n 30
+            # The sriov PAM failure happens in the nested kolla container, so
+            # its own /etc/shadow mode is what matters there.
+            podman exec "$inst" podman exec "$name" ls -l /etc/shadow 2>&1
+            podman exec "$inst" journalctl --no-pager -a --since '-30 min' CONTAINER_NAME="$name" | tail -n 200
+          done
+        done
+        exit 0
