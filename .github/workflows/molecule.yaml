@@ -80,11 +80,11 @@ jobs:
     - name: Select molecule destroy strategy
       id: flags
       run: |
-        # These roles fail on ubuntu-24.04 for reasons that are only visible
-        # from inside a live instance, so keep the instance around on failure.
+        # These roles have had their failure cause only visible from inside a
+        # live instance, so keep the instance around on failure.
         destroy=always
         case "${{ matrix.tested_role }}" in
-        edpm_cyborg | edpm_neutron_sriov | edpm_telemetry_logging)
+        edpm_neutron_sriov | edpm_telemetry_logging)
           destroy=never
           ;;
         esac
@@ -98,6 +98,35 @@ jobs:
     - name: Install molecule deps
       if: steps.check_role.outputs.modified == 'true'
       run: pip install -r molecule-requirements.txt
+    - name: Unload host AppArmor profiles that reach into the instances
+      if: steps.check_role.outputs.modified == 'true'
+      run: |
+        set -e
+        # Molecule runs podman rootless, which cannot carry an AppArmor profile
+        # choice into the container because setting it needs CAP_MAC_ADMIN. Any
+        # host profile matching a binary the instance execs is therefore
+        # auto-attached and mediates the process: unix-chkpwd denies the
+        # dac_read_search it needs to read /etc/shadow (a PAM account error for
+        # anything doing sudo), and rsyslogd denies the imjournal state file
+        # mknod and the signals to systemd.
+        for name in unix-chkpwd rsyslogd; do
+          found=0
+          # The loaded profile name need not be the file name, so match on
+          # either before assuming a path.
+          for path in $(compgen -G "/etc/apparmor.d/$name" \
+                           || compgen -G "/etc/apparmor.d/*$name*"); do
+            found=1
+            sudo apparmor_parser -R "$path" || true
+            # Also drop the file so a policy reload during the job does not
+            # re-attach the profile to a running instance.
+            sudo rm -f "$path"
+          done
+          if [[ $found -eq 0 ]]; then
+            echo "no /etc/apparmor.d file for profile '$name'"
+          fi
+        done
+        echo '--- loaded profiles after removal ---'
+        sudo aa-status || true
     - name: Run molecule test
       if: steps.check_role.outputs.modified == 'true'
       run: |

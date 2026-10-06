@@ -39,6 +39,19 @@
         name: rsyslog
         state: present
 
+    # rsyslog >= 8.2310 drops its capability bounding set at startup and exits
+    # when the drop fails. Inside a molecule instance the bounding-set prctl is
+    # denied, which takes rsyslogd down before the Restart rsyslog handler can
+    # succeed. RHEL 9.4+ exposes the switch for this.
+    - name: Deploy rsyslog global config that tolerates a failed capability drop
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/00-libcapng.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          global(libcapng.default="off")
+
     - name: Restart rsyslog
       ansible.builtin.systemd:
         state: restarted
