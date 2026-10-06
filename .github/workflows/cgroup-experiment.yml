@@ -1,0 +1,100 @@
+name: cgroup experiment (fork, throwaway)
+
+# edpm_telemetry_logging converge fails on ubuntu-24.04 runners with
+#   systemd[1]: rsyslog.service: Failed to kill control group
+#               /system.slice/rsyslog.service, ignoring: Permission denied
+# while ubuntu-22.04 passes. This workflow creates the same molecule instance
+# under different cgroup/AppArmor settings and reports, for each, whether
+# 'systemctl restart rsyslog' works. It is a bisect of the fix, not a test.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-24.04
+          label: baseline
+          opts: ""
+        - runner: ubuntu-24.04
+          label: cgroupns-host
+          opts: "--cgroupns=host"
+        - runner: ubuntu-24.04
+          label: cgroupfs
+          opts: "--cgroup-manager=cgroupfs"
+        - runner: ubuntu-24.04
+          label: apparmor-unconfined
+          opts: "--security-opt apparmor=unconfined"
+        - runner: ubuntu-24.04
+          label: tmpfs-sys-fs-cgroup
+          opts: "--tmpfs /sys/fs/cgroup"
+        - runner: ubuntu-22.04
+          label: ref-2204
+          opts: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      INSTANCE: probe-${{ matrix.label }}
+    steps:
+    - name: Print host cgroup environment
+      run: |
+        strip() { sed -e 's/\x1b\[[0-9;]*m//g'; }
+        {
+          echo "== runner: ${{ matrix.runner }} / variant: ${{ matrix.label }} / opts: ${{ matrix.opts }}"
+          echo "== os =="; (cat /etc/os-release | grep PRETTY) || true
+          echo "== container tools =="; podman --version; crun --version 2>/dev/null || runc --version 2>/dev/null | head -2
+          echo "== fstype /sys/fs/cgroup =="; stat -fc '%T' /sys/fs/cgroup
+          echo "== mounts under /sys/fs/cgroup =="; findmnt -t cgroup2,cgroup --merged -o TARGET,FSTYPE,OPTIONS 2>/dev/null | head -10
+          echo "== cgroup of current shell =="; cat /proc/self/cgroup
+          echo "== delegate.max for runner's user slice =="; cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/delegate.max 2>/dev/null || echo "n/a"
+        } | strip | while IFS= read -r l; do echo "::notice title=host(${{ matrix.runner }}/${{ matrix.label }})::$l"; done
+
+    - name: Start privileged systemd container with probe options
+      run: |
+        podman run -d --name "$INSTANCE" --privileged \
+          ${{ matrix.opts }} \
+          --tmpfs /run --tmpfs /tmp \
+          --env container=podman --tty \
+          registry.access.redhat.com/ubi9/ubi-init:latest /sbin/init 2>&1 | tail -3
+        sleep 8
+        podman ps --filter name="$INSTANCE" --format '{{.Names}} {{.Status}}'
+
+    - name: Install rsyslog and exercise restart
+      run: |
+        podman exec "$INSTANCE" dnf -qq -y install rsyslog sudo >/dev/null 2>&1 || \
+          podman exec "$INSTANCE" dnf -y install rsyslog sudo 2>&1 | tail -2
+        podman exec "$INSTANCE" systemctl start rsyslog 2>&1 | tail -3
+        sleep 2
+        echo "--- first start state ---"
+        podman exec "$INSTANCE" systemctl is-active rsyslog 2>&1 || true
+        set +e
+        podman exec "$INSTANCE" systemctl restart rsyslog >/tmp/restart.out 2>&1
+        rc=$?
+        set -e
+        echo "restart_rc=$rc"
+        echo "result=$([ $rc -eq 0 ] && echo PASS || echo FAIL)" >> "$GITHUB_ENV"
+        cat /tmp/restart.out | tail -5
+        {
+          echo "== restart rc=$rc =="
+          echo "== journal tail =="
+          podman exec "$INSTANCE" journalctl -u rsyslog --no-pager -b 2>&1 | tail -12
+          echo "== systemd 'kill control group' lines =="
+          podman exec "$INSTANCE" journalctl -b --no-pager 2>&1 | grep -i 'kill control group\|cgroup' | tail -8
+          echo "== container-internal cgroup =="
+          podman exec "$INSTANCE" stat -fc '%T' /sys/fs/cgroup 2>&1
+          podman exec "$INSTANCE" cat /proc/1/cgroup 2>&1 | head -3
+          echo "== cgroup controllers visible =="
+          podman exec "$INSTANCE" cat /sys/fs/cgroup/cgroup.controllers 2>&1 | head -2
+        } 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | while IFS= read -r l; do
+          echo "::error title=DIAG(${{ matrix.runner }}/${{ matrix.label }})::$l"
+        done
+    - name: Report
+      run: |
+        echo "### ${{ matrix.runner }} / ${{ matrix.label }} opts=\`${{ matrix.opts }}\` → **${result}**" >> "$GITHUB_STEP_SUMMARY"
+        echo "restart rc summary: ${result}"
+    - name: Cleanup
+      if: always()
+      run: podman rm -fa "$INSTANCE" >/dev/null 2>&1 || true
