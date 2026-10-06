@@ -34,6 +34,7 @@ jobs:
     steps:
     - name: Probe
       run: |
+        set +e
         $PM rm -fa "$INSTANCE" >/dev/null 2>&1 || true
         $PM run -d --name "$INSTANCE" --privileged \
           --tmpfs /run --tmpfs /tmp \
@@ -78,9 +79,21 @@ jobs:
           echo "--- final journal ---"
           $PM exec "$INSTANCE" journalctl -u rsyslog --no-pager -b 2>&1 | tail -18
         } > /tmp/probe.txt 2>&1
-        sed -e 's/\x1b\[[0-9;]*m//g' /tmp/probe.txt
-        packed=$(sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/:/%3A/g' /tmp/probe.txt | paste -sd '%0A' -)
-        echo "::notice title=FULL(${{ matrix.label }})::$packed"
+        cat /tmp/probe.txt | sed -e 's/\x1b\[[0-9;]*m//g'
+        clean=$(sed -e 's/\x1b\[[0-9;]*m//g' /tmp/probe.txt)
+        echo "$clean" | grep -E 'rc=|CGROUP_|CapEff|CapBnd|cgroup.kill|libcap|Main process|control group|cgroup=|podman version|rsyslog-' \
+          | head -18 | while IFS= read -r l; do
+            echo "::notice title=KEY(${{ matrix.label }})::$l"
+          done
+        rm -f /tmp/chk_*
+        split -l 12 /tmp/probe.txt /tmp/chk_
+        n=0
+        for f in /tmp/chk_*; do
+          n=$((n+1))
+          packed=$(sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/:/%3A/g' "$f" | paste -sd '%0A' -)
+          echo "::notice title=CHUNK${n}(${{ matrix.label }})::$packed"
+        done
+        exit 0
     - name: Cleanup
       if: always()
       run: $PM rm -fa "$INSTANCE" >/dev/null 2>&1 || true
