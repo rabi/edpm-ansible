@@ -1,0 +1,94 @@
+name: Run Molecule tests (fork debug, no gate)
+
+# Throwaway copy of molecule.yaml with the check_role "modified" gate removed,
+# so the matrix actually executes on the fork. No continue-on-error anywhere:
+# a red job means molecule failed.
+#
+# Failure detail is published three ways because the raw Actions log is served
+# from blob storage that is not always reachable:
+#   1. $GITHUB_STEP_SUMMARY  -> rendered on the run page
+#   2. ::error:: annotations -> GET /repos/{o}/{r}/check-runs/{id}/annotations
+#   3. molecule.log artifact
+
+on:
+  push:
+    branches:
+    - main
+  workflow_dispatch:
+    inputs:
+      role:
+        description: 'Role to test'
+        required: false
+        default: 'edpm_telemetry'
+
+jobs:
+  molecule:
+    strategy:
+      fail-fast: false
+      matrix:
+        tested_role:
+        - edpm_telemetry
+        - edpm_telemetry_logging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: '3.14'
+    - name: Install ansible
+      run: pip install ansible
+    - name: Install collections
+      run: ansible-galaxy collection install --force -r requirements.yml
+    - name: Install molecule deps
+      run: pip install -r molecule-requirements.txt
+    - name: Run molecule test
+      run: |
+        cd $GITHUB_WORKSPACE/roles/${{ matrix.tested_role }}
+        set +e
+        molecule test --all 2>&1 | tee "$RUNNER_TEMP/molecule.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        echo "molecule_rc=${rc}" >> "$GITHUB_ENV"
+        echo "Ran molecule test --all for ${{ matrix.tested_role }} with rc=${rc}"
+        exit "${rc}"
+      env:
+        PY_COLORS: '1'
+        ANSIBLE_FORCE_COLOR: '1'
+        ANSIBLE_VERBOSITY: 2
+        ANSIBLE_CALLBACKS_ENABLED: profile_tasks
+    - name: Container state
+      if: always()
+      run: |
+        echo "=== podman ps ==="
+        podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
+        echo "=== /etc/shadow inside instance ==="
+        podman exec instance stat -c 'mode=%a owner=%u:%g' /etc/shadow /etc/gshadow 2>&1 || true
+        echo "=== sudo inside instance ==="
+        podman exec instance sudo -n true 2>&1; echo "sudo -n rc=$?" || true
+        echo "=== host apparmor denials ==="
+        sudo dmesg 2>/dev/null | grep -i apparmor | grep -i denied | tail -20 || true
+    - name: Publish failure detail
+      if: always()
+      run: |
+        LOG="$RUNNER_TEMP/molecule.log"
+        {
+          echo "### molecule ${{ matrix.tested_role }} -- rc=${molecule_rc}"
+          echo '```'
+          grep -E 'PLAY RECAP|ok=|changed=|unreachable=|failed=|Fatal:|PAM |apparmor|DENIED' "$LOG" | tail -40
+          echo '--- last 80 lines ---'
+          tail -80 "$LOG"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        grep -E 'Fatal:|PAM | Authentication service|DENIED|failed=[1-9]|unreachable=[1-9]' "$LOG" \
+          | tail -25 > "$RUNNER_TEMP/errs.txt" || true
+        while IFS= read -r line; do
+          echo "::error title=molecule ${{ matrix.tested_role }}::${line}"
+        done < "$RUNNER_TEMP/errs.txt"
+    - name: Upload molecule log
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540446e3ecb6ed10264164b2 # v4
+      with:
+        name: molecule-${{ matrix.tested_role }}.log
+        path: ${{ runner.temp }}/molecule.log
