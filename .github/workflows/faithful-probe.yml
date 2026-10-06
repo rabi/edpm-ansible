@@ -11,6 +11,9 @@ name: faithful instance probe (fork, throwaway)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   probe:
     strategy:
@@ -76,6 +79,19 @@ jobs:
         grep -E '^\+ (systemctl|ls |printf|rm )|^(active|inactive|failed)|  rc=|CGROUP_|cgroup=|CapEff|CapBnd|KillMode|Main process|control group' "$OUT" \
           | head -9 | sed -e 's/:/%3A/g' -e 's/%/%25/g' \
           | while IFS= read -r l; do echo "::notice title=KEY(${{ matrix.runs-on }})::$l"; done
+    - name: Upload report to fork
+      if: always()
+      run: |
+        set +e
+        label=$(echo "${{ matrix.runs-on }}" | tr '.' '-')
+        body=$(base64 -w0 "$RUNNER_TEMP/out.txt")
+        path="probe-reports/faithful-${label}.txt"
+        sha=$(gh api "repos/${{ github.repository }}/contents/${path}?ref=main" --jq .sha 2>/dev/null || true)
+        if [ -n "$sha" ]; then
+          gh api -X PUT "repos/${{ github.repository }}/contents/${path}" -f message="probe report $label" -f content="$body" -f sha="$sha" -f branch=main
+        else
+          gh api -X PUT "repos/${{ github.repository }}/contents/${path}" -f message="probe report $label" -f content="$body" -f branch=main
+        fi
     - name: Verdict
       if: always()
       run: |
