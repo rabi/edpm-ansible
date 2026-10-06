@@ -1,12 +1,12 @@
 name: faithful instance probe (fork, throwaway)
 
-# Uses molecule itself to create the edpm_telemetry_logging instance (same
-# Containerfile.j2, same podman driver flags as CI), then runs a battery of
-# systemd/service experiments inside it. ubuntu-22.04 vs ubuntu-24.04.
-# Results are written to $GITHUB_STEP_SUMMARY, which is readable via
-#   GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs/{job_id}/summary
-# (annotations are capped at 10 per check run; logs/artifacts live on blob
-#  storage that is unreachable from some networks).
+# Creates the edpm_telemetry_logging instance with molecule itself (same
+# Containerfile.j2, same podman driver flags as CI), then runs systemd/service
+# experiments inside it on ubuntu-22.04 vs ubuntu-24.04.
+# Publishing channel: annotations are capped at 10 per check run and
+# logs/artifacts sit on blob storage unreachable from some networks, so the
+# report is emitted as (a) KEY annotations for the decisive lines and (b) the
+# full dump as a job summary.
 
 on:
   workflow_dispatch:
@@ -36,57 +36,50 @@ jobs:
     - name: Create instance with molecule
       run: |
         cd "$GITHUB_WORKSPACE/roles/edpm_telemetry_logging"
-        molecule create 2>&1 | tail -20
-        podman ps -a --format '{{.Names}} {{.Status}} {{.Image}}'
+        molecule create 2>&1 | tail -15
+        podman ps -a --format '{{.Names}} {{.Status}} {{.Image}}' | tee "$RUNNER_TEMP/ps.txt"
     - name: Experiments inside the molecule instance
-      run: |
-        OUT=$RUNNER_TEMP/out.md
-        {
-        echo "### runner ${{ matrix.runs-on }}"
-        echo
-        echo '```'
-        E() { echo "+ $*"; podman exec instance sh -c "$*" 2>&1; echo "  -> rc=$?"; }
-        echo "## host tooling"
-        podman --version; podman info --format 'cgroup={{.Host.CgroupVersion}} mgr={{.Host.CgroupManager}} rootless={{.Host.Security.Rootless}}' 2>/dev/null
-        crun --version 2>/dev/null | head -1
-        stat -fc 'host cgroup fstype=%T' /sys/fs/cgroup
-        echo
-        echo "## container identity"
-        E 'rpm -q rsyslog systemd; uname -r'
-        E 'cat /proc/1/comm; systemctl --version | head -1'
-        E 'grep -E "CapEff|CapBnd" /proc/1/status'
-        E 'findmnt -no SOURCE,FSTYPE,OPTIONS /sys/fs/cgroup'
-        E 'cat /proc/1/cgroup'
-        E 'ls /sys/fs/cgroup/ | head -20'
-        E 'cat /sys/fs/cgroup/cgroup.controllers 2>&1; cat /sys/fs/cgroup/cgroup.subtree_control 2>&1'
-        E 'touch /sys/fs/cgroup/.w 2>&1 && echo CGROUP_RW || echo CGROUP_RO; rm -f /sys/fs/cgroup/.w'
-        echo
-        echo "## rsyslog lifecycle"
-        E 'systemctl is-enabled rsyslog 2>&1; systemctl is-active rsyslog 2>&1'
-        E 'systemctl start rsyslog; sleep 2; systemctl is-active rsyslog'
-        E 'ls -l /sys/fs/cgroup/system.slice/rsyslog.service/cgroup.kill 2>&1'
-        E 'cat /sys/fs/cgroup/system.slice/rsyslog.service/cgroup.kill 2>&1 | head -1'
-        E 'systemctl restart rsyslog; sleep 2; systemctl is-active rsyslog'
-        E 'journalctl -u rsyslog --no-pager -b | tail -20'
-        echo
-        echo "## variant: KillMode=process"
-        E 'mkdir -p /etc/systemd/system/rsyslog.service.d; printf "[Service]\nKillMode=process\n" > /etc/systemd/system/rsyslog.service.d/override.conf; systemctl daemon-reload'
-        E 'systemctl restart rsyslog; sleep 2; systemctl is-active rsyslog'
-        E 'journalctl -u rsyslog --no-pager -b | tail -8'
-        echo
-        echo "## variant: KillMode=none"
-        E 'printf "[Service]\nKillMode=none\n" > /etc/systemd/system/rsyslog.service.d/override.conf; systemctl daemon-reload'
-        E 'systemctl stop rsyslog 2>&1; sleep 1; systemctl start rsyslog 2>&1; sleep 2; systemctl is-active rsyslog'
-        E 'printf "[Service]\nKillMode=process\n" > /etc/systemd/system/rsyslog.service.d/override.conf; systemctl daemon-reload'
-        echo
-        echo "## variant: SUID/priv sanity"
-        E 'grep -E "NoNewPrivs|Seccomp|Seccomp_filters" /proc/1/status'
-        E 'systemd-analyze security rsyslog 2>&1 | head -12'
-        } > "$OUT" 2>&1
-        cat "$OUT"
-        cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
-        head -c 1500 "$OUT" | sed -e 's/:/%3A/g' -e 's/%/%25/g' | paste -sd '%0A' - | { read -r m; echo "::notice title=OUT(${{ matrix.runs-on }})::$m"; }
-    - name: Verdict line
       if: always()
       run: |
-        grep -E 'is-active|rc=' "$RUNNER_TEMP/out.md" 2>/dev/null | tail -12 || true
+        set +e
+        OUT=$RUNNER_TEMP/out.txt
+        : > "$OUT"
+        E() { echo "+ $*" >> "$OUT"; podman exec instance sh -c "$*" >> "$OUT" 2>&1; echo "  rc=$?" >> "$OUT"; }
+        echo "## host tooling ($(grep PRETTY /etc/os-release))" >> "$OUT"
+        podman --version >> "$OUT" 2>&1
+        podman info --format 'cgroup={{.Host.CgroupVersion}} mgr={{.Host.CgroupManager}} rootless={{.Host.Security.Rootless}}' >> "$OUT" 2>&1
+        crun --version 2>/dev/null | head -1 >> "$OUT"
+        E 'rpm -q systemd rsyslog; systemctl --version | head -1'
+        E 'dnf -qq -y install rsyslog >/dev/null; rpm -q rsyslog'
+        E 'grep -E "CapEff|CapBnd|NoNewPrivs|Seccomp:" /proc/1/status'
+        E 'findmnt -no SOURCE,FSTYPE,OPTIONS /sys/fs/cgroup; cat /proc/1/cgroup'
+        E 'cat /sys/fs/cgroup/cgroup.controllers; cat /sys/fs/cgroup/cgroup.subtree_control'
+        E 'touch /sys/fs/cgroup/.w 2>/dev/null && echo CGROUP_RW || echo CGROUP_RO; rm -f /sys/fs/cgroup/.w'
+        E 'systemctl is-enabled rsyslog; systemctl is-active rsyslog'
+        E 'systemctl start rsyslog; sleep 2; systemctl is-active rsyslog'
+        E 'ls /sys/fs/cgroup/system.slice/rsyslog.service/ 2>&1 | tr "\n" " "'
+        E 'systemctl restart rsyslog; sleep 2; systemctl is-active rsyslog'
+        E 'journalctl -u rsyslog --no-pager -b | tail -18'
+        E 'mkdir -p /etc/systemd/system/rsyslog.service.d'
+        E 'printf "[Service]\nKillMode=process\n" >/etc/systemd/system/rsyslog.service.d/o.conf; systemctl daemon-reload; systemctl restart rsyslog; sleep 2; systemctl is-active rsyslog'
+        E 'printf "[Service]\nKillMode=none\n" >/etc/systemd/system/rsyslog.service.d/o.conf; systemctl daemon-reload; systemctl stop rsyslog; sleep 1; systemctl start rsyslog; sleep 2; systemctl is-active rsyslog'
+        E 'rm -f /etc/systemd/system/rsyslog.service.d/o.conf; systemctl daemon-reload; systemctl kill -s HUP rsyslog; sleep 1; systemctl is-active rsyslog'
+        exit 0
+    - name: Publish
+      if: always()
+      run: |
+        set +e
+        OUT=$RUNNER_TEMP/out.txt
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        grep -E '^\+ (systemctl|ls |printf|rm )|^(active|inactive|failed)|  rc=|CGROUP_|cgroup=|CapEff|CapBnd|KillMode|Main process|control group' "$OUT" \
+          | head -9 | sed -e 's/:/%3A/g' -e 's/%/%25/g' \
+          | while IFS= read -r l; do echo "::notice title=KEY(${{ matrix.runs-on }})::$l"; done
+    - name: Verdict
+      if: always()
+      run: |
+        set +e
+        grep -nE 'systemctl (start|restart)|^active$|^inactive$|^failed$|  rc=' "$RUNNER_TEMP/out.txt" \
+          | sed -e 's/:/%3A/g' -e 's/%/%25/g' | tail -9 \
+          | while IFS= read -r l; do echo "::warning title=SEQ(${{ matrix.runs-on }})::$l"; done
