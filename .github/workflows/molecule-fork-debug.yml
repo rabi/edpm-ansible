@@ -1,35 +1,30 @@
 name: Run Molecule tests (fork debug, no gate)
 
 # Throwaway copy of molecule.yaml with the check_role "modified" gate removed,
-# so the matrix actually executes on the fork. No continue-on-error anywhere:
-# a red job means molecule failed.
+# so the matrix actually executes on the fork. No continue-on-error: a red job
+# means molecule failed.
 #
-# Failure detail is published three ways because the raw Actions log is served
-# from blob storage that is not always reachable:
-#   1. $GITHUB_STEP_SUMMARY  -> rendered on the run page
-#   2. ::error:: annotations -> GET /repos/{o}/{r}/check-runs/{id}/annotations
-#   3. molecule.log artifact
+# Raw logs and artifacts are served from blob storage that is not reachable
+# from everywhere, so all diagnosis is published as ::error:: annotations
+# (GET /repos/{o}/{r}/check-runs/{id}/annotations) and the step summary.
 
 on:
   push:
     branches:
     - main
   workflow_dispatch:
-    inputs:
-      role:
-        description: 'Role to test'
-        required: false
-        default: 'edpm_telemetry'
 
 jobs:
   molecule:
     strategy:
       fail-fast: false
       matrix:
+        runs-on:
+        - ubuntu-22.04
+        - ubuntu-24.04
         tested_role:
-        - edpm_telemetry
         - edpm_telemetry_logging
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 60
     steps:
     - name: Checkout repository
@@ -47,46 +42,50 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/roles/${{ matrix.tested_role }}
         set +e
-        molecule test --all 2>&1 | tee "$RUNNER_TEMP/molecule.log"
+        molecule test --all --destroy never 2>&1 | tee "$RUNNER_TEMP/molecule.log"
         rc=${PIPESTATUS[0]}
         set -e
         echo "molecule_rc=${rc}" >> "$GITHUB_ENV"
-        echo "Ran molecule test --all for ${{ matrix.tested_role }} with rc=${rc}"
+        echo "molecule test --all for ${{ matrix.tested_role }} on ${{ matrix.runs-on }}: rc=${rc}"
         exit "${rc}"
       env:
         PY_COLORS: '1'
         ANSIBLE_FORCE_COLOR: '1'
         ANSIBLE_VERBOSITY: 2
         ANSIBLE_CALLBACKS_ENABLED: profile_tasks
-    - name: Host state
+    - name: Diagnose instance
       if: always()
       run: |
-        echo "=== podman ps ==="
-        podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
-        echo "=== host apparmor denials ==="
-        sudo dmesg 2>/dev/null | grep -i apparmor | grep -i denied | tail -20 || true
-        exit 0
-    - name: Publish failure detail
-      if: always()
-      run: |
-        LOG="$RUNNER_TEMP/molecule.log"
+        strip() { sed -e 's/\x1b\[[0-9;]*m//g'; }
         {
-          echo "### molecule ${{ matrix.tested_role }} -- rc=${molecule_rc}"
+          echo "=== instance state ==="
+          podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
+          echo "=== failing service inside instance ==="
+          podman exec instance systemctl --failed --no-legend --no-pager 2>&1 || true
+          echo "=== rsyslogd config check (-N1) ==="
+          podman exec instance rsyslogd -N1 2>&1 | tail -25 || true
+          echo "=== journalctl -u rsyslog ==="
+          podman exec instance journalctl -u rsyslog --no-pager -b 2>&1 | tail -40 || true
+          echo "=== status of rsyslog ==="
+          podman exec instance systemctl status rsyslog --no-pager -l 2>&1 | tail -30 || true
+        } > "$RUNNER_TEMP/diag.log" 2>&1
+        cat "$RUNNER_TEMP/diag.log"
+        {
+          echo "### molecule ${{ matrix.tested_role }} on ${{ matrix.runs-on }} -- molecule_rc=${molecule_rc}"
           echo '```'
-          grep -inE 'play recap|ok=|changed=|unreachable=|failed=|fatal:|pam |apparmor|denied' "$LOG" | tail -40
-          echo '--- last 80 lines ---'
-          tail -80 "$LOG"
+          grep -inE 'play recap|fatal:|failed to|pam |error' "$RUNNER_TEMP/molecule.log" | strip | tail -25
+          echo '--- instance diagnosis ---'
+          tail -60 "$RUNNER_TEMP/diag.log"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
-        grep -inE 'fatal:|pam |authentication service|denied|failed=[1-9]|unreachable=[1-9]|^error' "$LOG" \
-          | sed -e 's/\x1b\[[0-9;]*m//g' | tail -30 > "$RUNNER_TEMP/errs.txt" || true
-        while IFS= read -r line; do
-          echo "::error title=molecule ${{ matrix.tested_role }}::${line}"
-        done < "$RUNNER_TEMP/errs.txt"
-        echo "full log lines: $(wc -l < "$LOG")"
-    - name: Upload molecule log
+        {
+          grep -inE 'fatal:|failed to|pam |error|invalid|unterminated' "$RUNNER_TEMP/molecule.log" | strip | tail -12
+          grep -inE 'error|invalid|fail|cannot|refused|denied' "$RUNNER_TEMP/diag.log" | strip | tail -18
+        } | while IFS= read -r line; do
+          echo "::error title=${{ matrix.runs-on }} / ${{ matrix.tested_role }}::${line}"
+        done
+    - name: Destroy instance
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-      with:
-        name: molecule-${{ matrix.tested_role }}
-        path: ${{ runner.temp }}/molecule.log
+      run: |
+        cd $GITHUB_WORKSPACE/roles/${{ matrix.tested_role }}
+        molecule destroy || true
