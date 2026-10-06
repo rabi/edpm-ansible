@@ -86,9 +86,4 @@ jobs:
         while IFS= read -r line; do
           echo "::error title=molecule ${{ matrix.tested_role }}::${line}"
         done < "$RUNNER_TEMP/errs.txt"
-    - name: Upload molecule log
-      if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540446e3ecb6ed10264164b2 # v4
-      with:
-        name: molecule-${{ matrix.tested_role }}.log
-        path: ${{ runner.temp }}/molecule.log
+        echo "full log lines: $(wc -l < "$LOG")"
