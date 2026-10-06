@@ -59,7 +59,14 @@ jobs:
     - name: Check whether the role or the molecule harness is modified
       id: check_role
       run: |
-        git fetch origin "$GITHUB_BASE_REF"
+        # GITHUB_BASE_REF is only populated for pull_request events. Without a
+        # base there is no diff to gate on, so a dispatched run tests everything
+        # instead of reporting success without running molecule at all.
+        if [[ -z "$GITHUB_BASE_REF" ]]; then
+          echo "modified=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        git fetch --no-tags origin "$GITHUB_BASE_REF"
         # The molecule harness (this workflow, the shared Containerfile and the
         # python/collection requirements) is used by every role, so a change to
         # it has to run the whole matrix, not just the roles it also touches.
