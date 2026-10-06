@@ -58,17 +58,14 @@ jobs:
         ANSIBLE_FORCE_COLOR: '1'
         ANSIBLE_VERBOSITY: 2
         ANSIBLE_CALLBACKS_ENABLED: profile_tasks
-    - name: Container state
+    - name: Host state
       if: always()
       run: |
         echo "=== podman ps ==="
         podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
-        echo "=== /etc/shadow inside instance ==="
-        podman exec instance stat -c 'mode=%a owner=%u:%g' /etc/shadow /etc/gshadow 2>&1 || true
-        echo "=== sudo inside instance ==="
-        podman exec instance sudo -n true 2>&1; echo "sudo -n rc=$?" || true
         echo "=== host apparmor denials ==="
         sudo dmesg 2>/dev/null | grep -i apparmor | grep -i denied | tail -20 || true
+        exit 0
     - name: Publish failure detail
       if: always()
       run: |
@@ -76,14 +73,20 @@ jobs:
         {
           echo "### molecule ${{ matrix.tested_role }} -- rc=${molecule_rc}"
           echo '```'
-          grep -E 'PLAY RECAP|ok=|changed=|unreachable=|failed=|Fatal:|PAM |apparmor|DENIED' "$LOG" | tail -40
+          grep -inE 'play recap|ok=|changed=|unreachable=|failed=|fatal:|pam |apparmor|denied' "$LOG" | tail -40
           echo '--- last 80 lines ---'
           tail -80 "$LOG"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
-        grep -E 'Fatal:|PAM | Authentication service|DENIED|failed=[1-9]|unreachable=[1-9]' "$LOG" \
-          | tail -25 > "$RUNNER_TEMP/errs.txt" || true
+        grep -inE 'fatal:|pam |authentication service|denied|failed=[1-9]|unreachable=[1-9]|^error' "$LOG" \
+          | sed -e 's/\x1b\[[0-9;]*m//g' | tail -30 > "$RUNNER_TEMP/errs.txt" || true
         while IFS= read -r line; do
           echo "::error title=molecule ${{ matrix.tested_role }}::${line}"
         done < "$RUNNER_TEMP/errs.txt"
         echo "full log lines: $(wc -l < "$LOG")"
+    - name: Upload molecule log
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: molecule-${{ matrix.tested_role }}
+        path: ${{ runner.temp }}/molecule.log
