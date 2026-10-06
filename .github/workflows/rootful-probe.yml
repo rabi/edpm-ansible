@@ -1,0 +1,86 @@
+name: rootful probe + caps (fork, throwaway)
+
+# Distinguishes the two candidate mechanisms for the noble-only
+# 'systemctl restart rsyslog' failure inside the molecule instance:
+#   (a) systemd cannot write cgroup.kill  -> EPERM killing the control group
+#   (b) the new rsyslogd exits because libcap-ng cannot drop the bounding
+#       set without CAP_SETPCAP
+# Reports via single ::notice annotations (annotation API caps ~15 per step,
+# so everything is packed into one message per step).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-22.04
+          pm: podman
+          label: 2204-rootless
+        - runner: ubuntu-24.04
+          pm: podman
+          label: 2404-rootless
+        - runner: ubuntu-24.04
+          pm: "sudo podman"
+          label: 2404-rootful
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      PM: ${{ matrix.pm }}
+      INSTANCE: probe-${{ matrix.label }}
+    steps:
+    - name: Probe
+      run: |
+        $PM rm -fa "$INSTANCE" >/dev/null 2>&1 || true
+        $PM run -d --name "$INSTANCE" --privileged \
+          --tmpfs /run --tmpfs /tmp \
+          --env container=podman --tty \
+          registry.access.redhat.com/ubi9/ubi-init:latest /sbin/init >/dev/null 2>&1
+        $PM exec "$INSTANCE" dnf -qq -y install rsyslog libcap-ng-utils >/dev/null 2>&1
+        sleep 5
+        {
+          echo "### variant ${{ matrix.label }} -- podman: $PM"
+          echo "--- podman/crun ---"
+          $PM --version; $PM info --format 'cgroup={{.Host.CgroupVersion}} mgr={{.Host.CgroupManager}} rootless={{.Host.Security.Rootless}}' 2>/dev/null
+          echo "--- caps of container pid1 ---"
+          $PM exec "$INSTANCE" grep -E 'CapEff|CapBnd|CapPrm' /proc/1/status
+          echo "--- capsh bounding ---"
+          $PM exec "$INSTANCE" capsh --print 2>&1 | grep -iE 'Current|Bounding' | head -4
+          echo "--- cgroup writable / mounted ---"
+          $PM exec "$INSTANCE" findmnt -no SOURCE,FSTYPE,OPTIONS /sys/fs/cgroup
+          $PM exec "$INSTANCE" sh -c 'touch /sys/fs/cgroup/.w 2>&1 && echo CGROUP_RW && rm -f /sys/fs/cgroup/.w || echo CGROUP_RO'
+          echo "--- cgroup.kill present for rsyslog unit? ---"
+          $PM exec "$INSTANCE" sh -c 'systemctl start rsyslog; sleep 1; ls -l /sys/fs/cgroup/system.slice/rsyslog.service/cgroup.kill 2>&1; cat /sys/fs/cgroup/cgroup.controllers'
+          echo "--- FIRST start (cold) ---"
+          $PM exec "$INSTANCE" systemctl restart rsyslog 2>&1; echo "cold_restart_rc=$?"
+          sleep 2
+          $PM exec "$INSTANCE" systemctl is-active rsyslog
+          echo "--- rsyslogd version / libcap-ng msg ---"
+          $PM exec "$INSTANCE" rpm -q rsyslog
+          $PM exec "$INSTANCE" journalctl -u rsyslog --no-pager -b 2>&1 | grep -iE 'libcap|capng|Main process|control group|Start(ing|ed)|Sending SIGKILL' | tail -12
+          echo "--- retry after drop-in KillMode=process ---"
+          $PM exec "$INSTANCE" mkdir -p /etc/systemd/system/rsyslog.service.d
+          printf '[Service]\nKillMode=process\n' | $PM exec -i "$INSTANCE" tee /etc/systemd/system/rsyslog.service.d/override.conf >/dev/null
+          $PM exec "$INSTANCE" systemctl daemon-reload
+          $PM exec "$INSTANCE" systemctl restart rsyslog 2>&1; echo "killmode_process_rc=$?"
+          sleep 2
+          $PM exec "$INSTANCE" systemctl is-active rsyslog
+          echo "--- retry after Restart=/no + explicit stop/start ---"
+          $PM exec "$INSTANCE" systemctl stop rsyslog 2>&1; sleep 1
+          $PM exec "$INSTANCE" systemctl start rsyslog 2>&1; echo "stop_start_rc=$?"
+          sleep 2
+          $PM exec "$INSTANCE" systemctl is-active rsyslog
+          echo "--- HUP reload instead ---"
+          $PM exec "$INSTANCE" systemctl reload rsyslog 2>&1; echo "reload_rc=$?"
+          echo "--- final journal ---"
+          $PM exec "$INSTANCE" journalctl -u rsyslog --no-pager -b 2>&1 | tail -18
+        } > /tmp/probe.txt 2>&1
+        sed -e 's/\x1b\[[0-9;]*m//g' /tmp/probe.txt
+        packed=$(sed -e 's/\x1b\[[0-9;]*m//g' -e 's/%/%25/g' -e 's/:/%3A/g' /tmp/probe.txt | paste -sd '%0A' -)
+        echo "::notice title=FULL(${{ matrix.label }})::$packed"
+    - name: Cleanup
+      if: always()
+      run: $PM rm -fa "$INSTANCE" >/dev/null 2>&1 || true
